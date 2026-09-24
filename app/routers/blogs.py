@@ -1,47 +1,118 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 
-from ..auth import get_current_user
+from ..auth import get_current_user, get_current_user_optional
 from ..database import get_db
-from ..models import Blog, User
-from ..schemas import BlogCreate, BlogOut
+from ..models import Blog, Comment, Like, User
+from ..schemas import (
+    BlogCreate,
+    BlogOut,
+    BlogUpdate,
+    CommentCreate,
+    CommentOut,
+    LikeOut,
+)
 
 router = APIRouter(prefix="/api/blogs", tags=["blogs"])
 
 
-def serialize_blog(blog: Blog) -> dict:
+def serialize_blog(blog: Blog, current_user: User | None = None) -> dict:
+    liked_by_me = False
+    if current_user is not None:
+        liked_by_me = any(like.user_id == current_user.id for like in blog.likes)
     return {
         "id": blog.id,
         "title": blog.title,
         "content": blog.content,
         "author_id": blog.author_id,
         "author_username": blog.author.username,
+        "author_avatar_url": blog.author.avatar_url,
         "created_at": blog.created_at,
+        "updated_at": blog.updated_at,
+        "like_count": len(blog.likes),
+        "comment_count": len(blog.comments),
+        "liked_by_me": liked_by_me,
     }
 
 
-@router.get("", response_model=list[BlogOut])
-def list_blogs(db: Session = Depends(get_db)):
-    blogs = (
-        db.query(Blog)
-        .options(joinedload(Blog.author))
-        .order_by(Blog.created_at.desc())
-        .all()
-    )
-    return [serialize_blog(b) for b in blogs]
+def serialize_comment(comment: Comment) -> dict:
+    return {
+        "id": comment.id,
+        "content": comment.content,
+        "user_id": comment.user_id,
+        "username": comment.user.username,
+        "avatar_url": comment.user.avatar_url,
+        "blog_id": comment.blog_id,
+        "created_at": comment.created_at,
+    }
 
 
-@router.get("/{blog_id}", response_model=BlogOut)
-def get_blog(blog_id: int, db: Session = Depends(get_db)):
+def _load_blog(db: Session, blog_id: int) -> Blog:
     blog = (
         db.query(Blog)
-        .options(joinedload(Blog.author))
+        .options(
+            joinedload(Blog.author),
+            joinedload(Blog.likes),
+            joinedload(Blog.comments).joinedload(Comment.user),
+        )
         .filter(Blog.id == blog_id)
         .first()
     )
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
-    return serialize_blog(blog)
+    return blog
+
+
+def _require_owner(blog: Blog, user: User) -> None:
+    if blog.author_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only manage your own blogs")
+
+
+@router.get("", response_model=list[BlogOut])
+def list_blogs(
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    blogs = (
+        db.query(Blog)
+        .options(
+            joinedload(Blog.author),
+            joinedload(Blog.likes),
+            joinedload(Blog.comments),
+        )
+        .order_by(Blog.created_at.desc())
+        .all()
+    )
+    return [serialize_blog(b, current_user) for b in blogs]
+
+
+@router.get("/mine", response_model=list[BlogOut])
+def list_my_blogs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blogs = (
+        db.query(Blog)
+        .options(
+            joinedload(Blog.author),
+            joinedload(Blog.likes),
+            joinedload(Blog.comments),
+        )
+        .filter(Blog.author_id == current_user.id)
+        .order_by(Blog.created_at.desc())
+        .all()
+    )
+    return [serialize_blog(b, current_user) for b in blogs]
+
+
+@router.get("/{blog_id}", response_model=BlogOut)
+def get_blog(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    blog = _load_blog(db, blog_id)
+    return serialize_blog(blog, current_user)
 
 
 @router.post("", response_model=BlogOut, status_code=status.HTTP_201_CREATED)
@@ -57,11 +128,120 @@ def create_blog(
     )
     db.add(blog)
     db.commit()
-    db.refresh(blog)
-    blog = (
-        db.query(Blog)
-        .options(joinedload(Blog.author))
-        .filter(Blog.id == blog.id)
+    return serialize_blog(_load_blog(db, blog.id), current_user)
+
+
+@router.put("/{blog_id}", response_model=BlogOut)
+def update_blog(
+    blog_id: int,
+    payload: BlogUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blog = _load_blog(db, blog_id)
+    _require_owner(blog, current_user)
+    blog.title = payload.title
+    blog.content = payload.content
+    db.commit()
+    return serialize_blog(_load_blog(db, blog_id), current_user)
+
+
+@router.delete("/{blog_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_blog(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blog = _load_blog(db, blog_id)
+    _require_owner(blog, current_user)
+    db.delete(blog)
+    db.commit()
+    return None
+
+
+@router.post("/{blog_id}/like", response_model=LikeOut)
+def toggle_like(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blog = _load_blog(db, blog_id)
+    existing = (
+        db.query(Like)
+        .filter(Like.blog_id == blog.id, Like.user_id == current_user.id)
         .first()
     )
-    return serialize_blog(blog)
+    if existing:
+        db.delete(existing)
+        db.commit()
+        liked = False
+    else:
+        db.add(Like(user_id=current_user.id, blog_id=blog.id))
+        db.commit()
+        liked = True
+
+    like_count = db.query(Like).filter(Like.blog_id == blog.id).count()
+    return {"liked": liked, "like_count": like_count}
+
+
+@router.get("/{blog_id}/comments", response_model=list[CommentOut])
+def list_comments(blog_id: int, db: Session = Depends(get_db)):
+    _load_blog(db, blog_id)
+    comments = (
+        db.query(Comment)
+        .options(joinedload(Comment.user))
+        .filter(Comment.blog_id == blog_id)
+        .order_by(Comment.created_at.asc())
+        .all()
+    )
+    return [serialize_comment(c) for c in comments]
+
+
+@router.post(
+    "/{blog_id}/comments",
+    response_model=CommentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_comment(
+    blog_id: int,
+    payload: CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _load_blog(db, blog_id)
+    comment = Comment(
+        content=payload.content.strip(),
+        user_id=current_user.id,
+        blog_id=blog_id,
+    )
+    db.add(comment)
+    db.commit()
+    comment = (
+        db.query(Comment)
+        .options(joinedload(Comment.user))
+        .filter(Comment.id == comment.id)
+        .first()
+    )
+    return serialize_comment(comment)
+
+
+@router.delete("/{blog_id}/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_comment(
+    blog_id: int,
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blog = _load_blog(db, blog_id)
+    comment = (
+        db.query(Comment)
+        .filter(Comment.id == comment_id, Comment.blog_id == blog_id)
+        .first()
+    )
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if comment.user_id != current_user.id and blog.author_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed to delete this comment")
+    db.delete(comment)
+    db.commit()
+    return None

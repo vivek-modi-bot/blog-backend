@@ -1,6 +1,10 @@
 # Blog Backend
 
-FastAPI backend for the blog site with Google OAuth2 and SQLite.
+FastAPI API for Ink & Co. — Google OAuth2, blogs, likes, comments, profiles.
+
+## Docs
+
+See [docs/TECHNICAL_DOCUMENTATION.md](docs/TECHNICAL_DOCUMENTATION.md) for architecture, API contracts, and usage.
 
 ## Setup
 
@@ -13,6 +17,5 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
-API docs: http://localhost:8000/docs
-
-Redirect URI for Google OAuth: `http://localhost:8000/api/auth/google/callback`
+API docs: http://localhost:8000/docs  
+Redirect URI: `http://localhost:8000/api/auth/google/callback`
